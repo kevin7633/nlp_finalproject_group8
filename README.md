@@ -1,10 +1,3 @@
-# 자연어처리 2026-1 기말 프로젝트: GPT-2 구현
-
-이 프로젝트는 GitHub 원본 저장소 `https://github.com/kikim6114/nlp2026-final`의 GPT-2 기반 과제 코드입니다.  
-제공된 원래 코드는 GPT-2 모델 구조, 데이터 로더, 학습/평가 스크립트, 제출 파일 생성 스크립트를 포함하고 있으며, 일부 핵심 함수의 빈 코드 블록을 직접 구현하도록 구성되어 있습니다.
-
-본 README는 아직 비어 있는 다른 과제 블록은 제외하고, 원래 제공 코드의 구성과 이번에 작성한 `modules/attention.py`, `optimizer.py` 구현 내용을 중심으로 설명합니다.
-
 ## 프로젝트 구성
 
 ### 모델 관련 코드
@@ -40,10 +33,6 @@
 - `paraphrase_detection.py`
   - Quora 문장쌍 데이터로 paraphrase detection을 수행하는 스크립트입니다.
   - GPT-2 출력을 paraphrase 여부 분류에 사용하도록 설계되어 있습니다.
-
-- `sonnet_generation.py`
-  - Shakespeare sonnet 데이터로 GPT-2를 fine-tuning하고, held-out prompt에서 sonnet을 생성하는 스크립트입니다.
-  - top-p sampling과 temperature를 이용한 생성 루프가 포함되어 있습니다.
 
 ### 데이터 및 평가 코드
 
@@ -93,56 +82,3 @@
 3. `correct_bias=True`인 경우 bias correction을 적용합니다.
 4. `addcdiv_()`를 사용해 Adam 업데이트를 수행합니다.
 5. 메인 gradient 업데이트 이후 decoupled weight decay를 적용합니다.
-
-이 방식은 과제 설명의 AdamW 요구사항인 moment update, bias correction, parameter update, weight decay 적용 순서를 만족합니다.
-
-## 구현 검토 결과
-
-작성한 두 파일은 원본 저장소 기준으로 비어 있던 코드 블록만 채운 상태입니다.
-
-- `modules/attention.py`
-  - tensor shape 흐름이 기존 `transform()` 및 `GPT2Layer` 호출 방식과 일치합니다.
-  - causal mask와 padding mask가 모두 적용됩니다.
-  - 간단한 로컬 검증에서 출력 shape가 정상이고, 첫 번째 토큰 출력이 미래 토큰 변화에 영향을 받지 않음을 확인했습니다.
-
-- `optimizer.py`
-  - 제공된 `optimizer_test.py`를 통과했습니다.
-  - 테스트 결과 reference weight와 실제 학습 후 weight가 허용 오차 안에서 일치했습니다.
-
-실행한 검증:
-
-```bash
-python optimizer_test.py
-```
-
-결과:
-
-```text
-Optimizer test passed!
-```
-
-## 실행 안내
-
-환경은 제공된 `env.yml`을 기준으로 생성합니다.
-
-```bash
-conda env create -f env.yml
-conda activate nlp_final
-```
-
-optimizer 구현만 확인하려면 다음 명령을 실행합니다.
-
-```bash
-python optimizer_test.py
-```
-
-전체 GPT-2 sanity check는 `models/gpt2.py`, `modules/gpt2_layer.py` 등 다른 빈 코드 블록까지 구현된 뒤 실행해야 합니다.
-
-```bash
-python sanity_check.py
-```
-
-## 주의 사항
-
-이 README는 현재 작성 완료된 `modules/attention.py`, `optimizer.py` 검토에 초점을 맞췄습니다.  
-`classifier.py`, `models/gpt2.py`, `modules/gpt2_layer.py`, `paraphrase_detection.py`, `sonnet_generation.py` 등에 남아 있는 빈 코드 블록은 이번 검토 범위에 포함하지 않았습니다.
