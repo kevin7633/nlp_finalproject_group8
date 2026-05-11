@@ -35,7 +35,24 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
 
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    attn_scores = torch.matmul(query, key.transpose(-1, -2))
+    attn_scores = attn_scores / (self.attention_head_size ** 0.5)
+
+    query_len, key_len = query.size(-2), key.size(-2)
+    causal_mask = torch.tril(
+      torch.ones((query_len, key_len), dtype=torch.bool, device=query.device)
+    )
+    attn_scores = attn_scores.masked_fill(~causal_mask.view(1, 1, query_len, key_len), -10000.0)
+
+    if attention_mask is not None:
+      attn_scores = attn_scores + attention_mask
+
+    attn_probs = torch.softmax(attn_scores, dim=-1)
+    attn_probs = self.dropout(attn_probs)
+
+    context = torch.matmul(attn_probs, value)
+    context = rearrange(context, 'b h t d -> b t (h d)')
+    return context
 
 
   def forward(self, hidden_states, attention_mask):
