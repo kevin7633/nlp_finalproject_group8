@@ -28,8 +28,9 @@ class GPT2Layer(nn.Module):
       - GPT-2 layer는 각 sublayer의 변환된 출력에 드롭아웃을 적용한 후, 이를 sublayer 입력에 더한다. 
         이 함수에서는 Layer Normalization을 적용하지 않는다.
     """
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    output = dense_layer(output)
+    output = dropout(output)
+    return input + output
 
 
   def forward(self, hidden_states, attention_mask):
@@ -41,5 +42,13 @@ class GPT2Layer(nn.Module):
       - Feed-Forward layer: hidden states를 추가로 refine하기 위해 변환을 적용한다.
     """
 
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    attention_input = self.attention_layer_norm(hidden_states)
+    attention_output = self.self_attention(attention_input, attention_mask)
+    hidden_states = self.add(hidden_states, attention_output, self.attention_dense, self.attention_dropout)
+
+    ffn_input = self.out_layer_norm(hidden_states)
+    ffn_output = self.interm_dense(ffn_input)
+    ffn_output = self.interm_af(ffn_output)
+    hidden_states = self.add(hidden_states, ffn_output, self.out_dense, self.out_dropout)
+
+    return hidden_states
