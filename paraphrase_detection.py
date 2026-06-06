@@ -1,40 +1,39 @@
 '''
-Paraphrase detection을 위한 시작 코드.
+Quora Paraphrase Detection with GPT-2 cloze-style yes/no prediction.
 
-고려 사항:
- - ParaphraseGPT: 여러분이 구현한 GPT-2 분류 모델 .
- - train: Quora paraphrase detection 데이터셋에서 ParaphraseGPT를 훈련시키는 절차.
- - test: Test 절차. 프로젝트 결과 제출에 필요한 파일들을 생성함.
-
-실행:
-  `python paraphrase_detection.py --use_gpu`
-ParaphraseGPT model을 훈련 및 평가하고, 필요한 제출용 파일을 작성한다.
+This script uses only train/dev for training, prompt selection, threshold tuning,
+and error analysis. The test split is loaded only after the best dev setting is
+fixed, to create the submission prediction file.
 '''
 
 import argparse
+import csv
+import json
+import os
 import random
-import torch
+import re
 
 import numpy as np
+import torch
 import torch.nn.functional as F
 
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import GPT2Tokenizer
 
 from datasets import (
   ParaphraseDetectionDataset,
   ParaphraseDetectionTestDataset,
-  load_paraphrase_data
+  load_paraphrase_data,
+  paraphrase_prompt,
 )
-from evaluation import model_eval_paraphrase, model_test_paraphrase
 from models.gpt2 import GPT2Model
-
 from optimizer import AdamW
 
-TQDM_DISABLE = False
+TQDM_DISABLE = True
 
-# Fix the random seed.
+
 def seed_everything(seed=11711):
   random.seed(seed)
   np.random.seed(seed)
@@ -46,32 +45,60 @@ def seed_everything(seed=11711):
 
 
 class ParaphraseGPT(nn.Module):
-  """Paraphrase Detection을 위해 설계된 여러분의 GPT-2 Model."""
+  """GPT-2 next-token model restricted to the answer tokens "no" and "yes"."""
 
   def __init__(self, args):
     super().__init__()
     self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
-    self.paraphrase_detection_head = nn.Linear(args.d, 2)  # Paraphrase detection 의 출력은 두 가지: 1 (yes) or 0 (no).
+    self.paraphrase_detection_head = nn.Linear(args.d, 2)
+    self.yes_token_id = args.yes_token_id
+    self.no_token_id = args.no_token_id
 
-    # 기본적으로, 전체 모델을 finetuning 한다.
     for param in self.gpt.parameters():
       param.requires_grad = True
 
+  def full_vocab_logits(self, input_ids, attention_mask):
+    outputs = self.gpt(input_ids, attention_mask)
+    return self.gpt.hidden_state_to_token(outputs['last_token'])
+
   def forward(self, input_ids, attention_mask):
-    """
-    TODO: paraphrase_detection_head Linear layer를 사용하여 토큰의 레이블을 예측하시오.
+    vocab_logits = self.full_vocab_logits(input_ids, attention_mask)
+    no_logits = vocab_logits[:, self.no_token_id]
+    yes_logits = vocab_logits[:, self.yes_token_id]
+    return torch.stack([no_logits, yes_logits], dim=1)
 
-    입력은 다음과 같은 구조를 갖는다:
 
-      'Is "{s1}" a paraphrase of "{s2}"? Answer "yes" or "no": '
+def ensure_dir(path):
+  os.makedirs(path, exist_ok=True)
 
-    따라서, 문장의 끝에서 다음 토큰에 대한 예측을 해야 할 것이다. 
-    훈련이 잘 되었다면, 패러프레이즈인 경우에는 토큰 "yes"(BPE index 8505)가, 
-    패러프레이즈가 아닌 경우에는 토큰 "no" (BPE index 3919)가 될 것이다.
-    """
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
 
+def json_safe_args(args):
+  result = {}
+  for key, value in vars(args).items():
+    if isinstance(value, (str, int, float, bool)) or value is None:
+      result[key] = value
+  return result
+
+
+def write_json(path, obj):
+  with open(path, 'w') as f:
+    json.dump(obj, f, indent=2, sort_keys=True)
+
+
+def write_prediction_csv(path, rows):
+  fieldnames = ['id', 'q1', 'q2', 'gold_label', 'pred_label', 'yes_score', 'no_score', 'correct']
+  with open(path, 'w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+
+def write_submission_csv(path, sent_ids, preds):
+  ensure_dir(os.path.dirname(path) or '.')
+  with open(path, 'w') as f:
+    f.write("id \t Predicted_Is_Paraphrase \n")
+    for sent_id, pred in zip(sent_ids, preds):
+      f.write(f"{sent_id}, {int(pred)} \n")
 
 
 def save_model(model, optimizer, args, filepath):
@@ -83,130 +110,11 @@ def save_model(model, optimizer, args, filepath):
     'numpy_rng': np.random.get_state(),
     'torch_rng': torch.random.get_rng_state(),
   }
-
   torch.save(save_info, filepath)
   print(f"save the model to {filepath}")
 
 
-def train(args):
-  """Quora 데이터셋에서 Paraphrase Detection을 위한 GPT-2 훈련."""
-  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  # 데이터, 해당 데이터셋 및 데이터로드 생성하기.
-  para_train_data = load_paraphrase_data(args.para_train)
-  para_dev_data = load_paraphrase_data(args.para_dev)
-
-  para_train_data = ParaphraseDetectionDataset(para_train_data, args)
-  para_dev_data = ParaphraseDetectionDataset(para_dev_data, args)
-
-  para_train_dataloader = DataLoader(para_train_data, shuffle=True, batch_size=args.batch_size,
-                                     collate_fn=para_train_data.collate_fn)
-  para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
-                                   collate_fn=para_dev_data.collate_fn)
-
-  args = add_arguments(args)
-  model = ParaphraseGPT(args)
-  model = model.to(device)
-
-  lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
-  best_dev_acc = 0
-
-  for epoch in range(args.epochs):
-    model.train()
-    train_loss = 0
-    num_batches = 0
-    for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
-      # 입력을 가져와서 GPU로 보내기(이 모델을 CPU에서 훈련시키는 것을 권장하지 않는다).
-      b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
-      b_ids = b_ids.to(device)
-      b_mask = b_mask.to(device)
-      labels = labels.to(device)
-
-      # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트. 
-      optimizer.zero_grad()
-      logits = model(b_ids, b_mask)
-      preds = torch.argmax(logits, dim=1)
-      loss = F.cross_entropy(logits, labels, reduction='mean')
-      loss.backward()
-      optimizer.step()
-
-      train_loss += loss.item()
-      num_batches += 1
-
-    train_loss = train_loss / num_batches
-
-    dev_acc, dev_f1, *_ = model_eval_paraphrase(para_dev_dataloader, model, device)
-
-    if dev_acc > best_dev_acc:
-      best_dev_acc = dev_acc
-      save_model(model, optimizer, args, args.filepath)
-
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
-
-
-@torch.no_grad()
-def test(args):
-  """Evaluate your model on the dev and test datasets; save the predictions to disk."""
-  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(args.filepath)
-
-  model = ParaphraseGPT(saved['args'])
-  model.load_state_dict(saved['model'])
-  model = model.to(device)
-  model.eval()
-  print(f"Loaded model to test from {args.filepath}")
-
-  para_dev_data = load_paraphrase_data(args.para_dev)
-  para_test_data = load_paraphrase_data(args.para_test, split='test')
-
-  para_dev_data = ParaphraseDetectionDataset(para_dev_data, args)
-  para_test_data = ParaphraseDetectionTestDataset(para_test_data, args)
-
-  para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
-                                   collate_fn=para_dev_data.collate_fn)
-  para_test_dataloader = DataLoader(para_test_data, shuffle=True, batch_size=args.batch_size,
-                                    collate_fn=para_test_data.collate_fn)
-
-  dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase(para_dev_dataloader, model, device)
-  print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
-  test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
-
-  with open(args.para_dev_out, "w+") as f:
-    f.write(f"id \t Predicted_Is_Paraphrase \n")
-    for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
-      f.write(f"{p}, {s} \n")
-
-  with open(args.para_test_out, "w+") as f:
-    f.write(f"id \t Predicted_Is_Paraphrase \n")
-    for p, s in zip(test_para_sent_ids, test_para_y_pred):
-      f.write(f"{p}, {s} \n")
-
-
-def get_args():
-  parser = argparse.ArgumentParser()
-
-  parser.add_argument("--para_train", type=str, default="data/quora-train.csv")
-  parser.add_argument("--para_dev", type=str, default="data/quora-dev.csv")
-  parser.add_argument("--para_test", type=str, default="data/quora-test-student.csv")
-  parser.add_argument("--para_dev_out", type=str, default="predictions/para-dev-output.csv")
-  parser.add_argument("--para_test_out", type=str, default="predictions/para-test-output.csv")
-
-  parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=10)
-  parser.add_argument("--use_gpu", action='store_true')
-
-  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
-  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
-  parser.add_argument("--model_size", type=str,
-                      help="The model size as specified on hugging face. DO NOT use the xl model.",
-                      choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
-
-  args = parser.parse_args()
-  return args
-
-
 def add_arguments(args):
-  """모델 크기에 따라 결정되는 인수들을 추가."""
   if args.model_size == 'gpt2':
     args.d = 768
     args.l = 12
@@ -221,12 +129,351 @@ def add_arguments(args):
     args.num_heads = 20
   else:
     raise Exception(f'{args.model_size} is not supported.')
+
+  tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+  yes_ids = tokenizer.encode('yes', add_special_tokens=False)
+  no_ids = tokenizer.encode('no', add_special_tokens=False)
+  if len(yes_ids) != 1 or len(no_ids) != 1:
+    raise ValueError(f"Expected single-token yes/no ids, got yes={yes_ids}, no={no_ids}")
+  args.yes_token_id = yes_ids[0]
+  args.no_token_id = no_ids[0]
+  return args
+
+
+def maybe_debug_subset(data, debug_subset):
+  if debug_subset is None or debug_subset <= 0:
+    return data
+  return data[:debug_subset]
+
+
+def add_bidirectional_examples(data):
+  augmented = []
+  for q1, q2, label, sent_id in data:
+    augmented.append((q1, q2, label, sent_id))
+    augmented.append((q2, q1, label, f"{sent_id}__rev"))
+  return augmented
+
+
+def encode_pairs(tokenizer, q1, q2, args, device):
+  prompts = [paraphrase_prompt(a, b, args.template_id) for a, b in zip(q1, q2)]
+  encoding = tokenizer(
+    prompts,
+    return_tensors='pt',
+    padding=True,
+    truncation=True,
+    max_length=args.max_length
+  )
+  return encoding['input_ids'].to(device), encoding['attention_mask'].to(device)
+
+
+@torch.no_grad()
+def score_batch(model, batch, device, args, tokenizer):
+  b_ids = batch['token_ids'].to(device)
+  b_mask = batch['attention_mask'].to(device)
+  logits = model(b_ids, b_mask)
+  probs = torch.softmax(logits, dim=1)
+  scores = probs[:, 1]
+
+  if args.bidirectional:
+    rev_ids, rev_mask = encode_pairs(tokenizer, batch['q2'], batch['q1'], args, device)
+    rev_probs = torch.softmax(model(rev_ids, rev_mask), dim=1)
+    scores = (scores + rev_probs[:, 1]) / 2.0
+
+  return scores.detach().cpu().numpy()
+
+
+@torch.no_grad()
+def evaluate_paraphrase(dataloader, model, device, args, tokenizer, threshold):
+  model.eval()
+  rows = []
+  y_true, y_pred = [], []
+  for batch in tqdm(dataloader, desc='eval', disable=TQDM_DISABLE):
+    scores = score_batch(model, batch, device, args, tokenizer)
+    preds = (scores >= threshold).astype(int)
+    labels = batch['labels'].cpu().numpy().astype(int)
+    for i, sent_id in enumerate(batch['sent_ids']):
+      gold = int(labels[i])
+      pred = int(preds[i])
+      row = {
+        'id': sent_id,
+        'q1': batch['q1'][i],
+        'q2': batch['q2'][i],
+        'gold_label': gold,
+        'pred_label': pred,
+        'yes_score': float(scores[i]),
+        'no_score': float(1.0 - scores[i]),
+        'correct': int(gold == pred),
+      }
+      rows.append(row)
+      y_true.append(gold)
+      y_pred.append(pred)
+
+  acc = float(np.mean(np.array(y_true) == np.array(y_pred))) if y_true else 0.0
+  return acc, rows
+
+
+@torch.no_grad()
+def predict_test(dataloader, model, device, args, tokenizer, threshold):
+  model.eval()
+  sent_ids, preds = [], []
+  for batch in tqdm(dataloader, desc='test', disable=TQDM_DISABLE):
+    scores = score_batch(model, batch, device, args, tokenizer)
+    batch_preds = (scores >= threshold).astype(int)
+    sent_ids.extend(batch['sent_ids'])
+    preds.extend([int(x) for x in batch_preds])
+  return sent_ids, preds
+
+
+def tune_threshold(dev_rows):
+  best_threshold = 0.5
+  best_acc = -1.0
+  thresholds = [round(x, 2) for x in np.arange(0.30, 0.701, 0.01)]
+  gold = np.array([int(row['gold_label']) for row in dev_rows])
+  scores = np.array([float(row['yes_score']) for row in dev_rows])
+  for threshold in thresholds:
+    preds = (scores >= threshold).astype(int)
+    acc = float(np.mean(preds == gold))
+    if acc > best_acc:
+      best_acc = acc
+      best_threshold = threshold
+  return best_threshold, best_acc
+
+
+def word_overlap(q1, q2):
+  w1 = set(re.findall(r"[a-z0-9]+", q1.lower()))
+  w2 = set(re.findall(r"[a-z0-9]+", q2.lower()))
+  if not w1 and not w2:
+    return 0.0
+  return len(w1 & w2) / max(1, len(w1 | w2))
+
+
+def error_analysis(dev_rows, output_dir):
+  errors = [row for row in dev_rows if int(row['correct']) == 0]
+  categories = {
+    'long_question_pair': [],
+    'high_overlap_different_meaning': [],
+    'low_overlap_same_meaning': [],
+    'number_date_place_proper_noun_difference': [],
+    'negation': [],
+    'ambiguous_yes_score': [],
+  }
+  neg_words = {'not', 'never', 'no'}
+  proper_or_number = re.compile(r"\b\d+\b|[A-Z][a-z]+")
+
+  for row in errors:
+    q1, q2 = row['q1'], row['q2']
+    overlap = word_overlap(q1, q2)
+    gold = int(row['gold_label'])
+    score = float(row['yes_score'])
+    if len(q1.split()) + len(q2.split()) >= 40:
+      categories['long_question_pair'].append(row)
+    if overlap >= 0.5 and gold == 0:
+      categories['high_overlap_different_meaning'].append(row)
+    if overlap <= 0.2 and gold == 1:
+      categories['low_overlap_same_meaning'].append(row)
+    if proper_or_number.search(q1) or proper_or_number.search(q2):
+      categories['number_date_place_proper_noun_difference'].append(row)
+    if neg_words & set(re.findall(r"[a-z]+", f"{q1} {q2}".lower())):
+      categories['negation'].append(row)
+    if 0.45 <= score <= 0.55:
+      categories['ambiguous_yes_score'].append(row)
+
+  summary = {
+    'num_dev_examples': len(dev_rows),
+    'num_errors': len(errors),
+    'error_rate': float(len(errors) / max(1, len(dev_rows))),
+    'category_counts': {name: len(rows) for name, rows in categories.items()},
+  }
+  write_json(os.path.join(output_dir, 'error_analysis.json'), summary)
+
+  example_rows = []
+  for name, rows in categories.items():
+    for row in rows[:20]:
+      item = dict(row)
+      item['error_type'] = name
+      example_rows.append(item)
+  if example_rows:
+    fieldnames = ['error_type', 'id', 'q1', 'q2', 'gold_label', 'pred_label', 'yes_score', 'no_score', 'correct']
+    with open(os.path.join(output_dir, 'error_analysis_examples.csv'), 'w', newline='') as f:
+      writer = csv.DictWriter(f, fieldnames=fieldnames)
+      writer.writeheader()
+      writer.writerows(example_rows)
+  else:
+    write_prediction_csv(os.path.join(output_dir, 'error_analysis_examples.csv'), [])
+  return summary
+
+
+def train(args):
+  device = torch.device('cuda') if args.use_gpu and torch.cuda.is_available() else torch.device('cpu')
+  ensure_dir(args.output_dir)
+  ensure_dir('predictions')
+
+  para_train_data = load_paraphrase_data(args.para_train)
+  para_dev_data = load_paraphrase_data(args.para_dev)
+  para_train_data = maybe_debug_subset(para_train_data, args.debug_subset)
+  para_dev_data = maybe_debug_subset(para_dev_data, args.debug_subset)
+  if args.bidirectional:
+    para_train_data = add_bidirectional_examples(para_train_data)
+
+  train_dataset = ParaphraseDetectionDataset(para_train_data, args)
+  dev_dataset = ParaphraseDetectionDataset(para_dev_data, args)
+  train_loader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size, collate_fn=train_dataset.collate_fn)
+  dev_loader = DataLoader(dev_dataset, shuffle=False, batch_size=args.batch_size, collate_fn=dev_dataset.collate_fn)
+
+  tokenizer = train_dataset.tokenizer
+  model = ParaphraseGPT(args).to(device)
+  optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+  best_dev_acc = -1.0
+  best_threshold = args.threshold
+  metrics = {
+    'epochs': [],
+    'best_dev_accuracy': None,
+    'best_threshold': None,
+    'test_used_for_training_or_tuning': False,
+  }
+  write_json(os.path.join(args.output_dir, 'config.json'), json_safe_args(args))
+
+  for epoch in range(args.epochs):
+    model.train()
+    optimizer.zero_grad()
+    train_loss = 0.0
+    num_steps = 0
+    for step, batch in enumerate(tqdm(train_loader, desc=f'train-{epoch}', disable=TQDM_DISABLE), start=1):
+      b_ids = batch['token_ids'].to(device)
+      b_mask = batch['attention_mask'].to(device)
+      labels = batch['labels'].to(device)
+
+      if args.restricted_yes_no_loss:
+        logits = model(b_ids, b_mask)
+        loss = F.cross_entropy(logits, labels, reduction='mean')
+      else:
+        vocab_logits = model.full_vocab_logits(b_ids, b_mask)
+        target_ids = torch.where(
+          labels == 1,
+          torch.full_like(labels, args.yes_token_id),
+          torch.full_like(labels, args.no_token_id)
+        )
+        loss = F.cross_entropy(vocab_logits, target_ids, reduction='mean')
+
+      (loss / args.grad_accum_steps).backward()
+      if step % args.grad_accum_steps == 0 or step == len(train_loader):
+        optimizer.step()
+        optimizer.zero_grad()
+
+      train_loss += loss.item()
+      num_steps += 1
+
+    train_loss = train_loss / max(1, num_steps)
+    dev_acc, dev_rows = evaluate_paraphrase(dev_loader, model, device, args, tokenizer, args.threshold)
+    epoch_threshold = args.threshold
+    threshold_acc = dev_acc
+    if args.threshold_tuning:
+      epoch_threshold, threshold_acc = tune_threshold(dev_rows)
+
+    metrics['epochs'].append({
+      'epoch': epoch,
+      'train_loss': train_loss,
+      'dev_accuracy_at_default_threshold': dev_acc,
+      'dev_accuracy': threshold_acc,
+      'threshold': epoch_threshold,
+    })
+
+    if threshold_acc > best_dev_acc:
+      best_dev_acc = threshold_acc
+      best_threshold = epoch_threshold
+      save_model(model, optimizer, args, args.filepath)
+      final_acc, final_rows = evaluate_paraphrase(dev_loader, model, device, args, tokenizer, best_threshold)
+      write_prediction_csv(os.path.join(args.output_dir, 'dev_predictions.csv'), final_rows)
+      write_prediction_csv(os.path.join(args.output_dir, 'dev_errors.csv'), [row for row in final_rows if int(row['correct']) == 0])
+
+    print(
+      f"Epoch {epoch}: train loss :: {train_loss:.3f}, "
+      f"dev acc :: {threshold_acc:.3f}, threshold :: {epoch_threshold:.2f}"
+    )
+
+  metrics['best_dev_accuracy'] = best_dev_acc
+  metrics['best_threshold'] = best_threshold
+  write_json(os.path.join(args.output_dir, 'metrics.json'), metrics)
+  write_json(os.path.join(args.output_dir, 'threshold.json'), {'threshold': best_threshold, 'source': 'dev'})
+
+  saved = torch.load(args.filepath, map_location=device)
+  model.load_state_dict(saved['model'])
+  final_acc, final_rows = evaluate_paraphrase(dev_loader, model, device, args, tokenizer, best_threshold)
+  write_prediction_csv(os.path.join(args.output_dir, 'dev_predictions.csv'), final_rows)
+  write_prediction_csv(os.path.join(args.output_dir, 'dev_errors.csv'), [row for row in final_rows if int(row['correct']) == 0])
+  analysis = error_analysis(final_rows, args.output_dir)
+  print(f"Best dev acc :: {final_acc:.3f}, threshold :: {best_threshold:.2f}")
+  print(f"Dev errors :: {analysis['num_errors']} / {analysis['num_dev_examples']}")
+
+  return best_threshold
+
+
+@torch.no_grad()
+def test(args, threshold):
+  device = torch.device('cuda') if args.use_gpu and torch.cuda.is_available() else torch.device('cpu')
+  saved = torch.load(args.filepath, map_location=device)
+  saved_args = saved['args']
+  model = ParaphraseGPT(saved_args)
+  model.load_state_dict(saved['model'])
+  model = model.to(device)
+  model.eval()
+  print(f"Loaded model to test from {args.filepath}")
+  print(f"Using dev-selected threshold {threshold:.2f}")
+
+  para_test_data = load_paraphrase_data(args.para_test, split='test')
+  para_test_data = maybe_debug_subset(para_test_data, args.debug_subset)
+  test_dataset = ParaphraseDetectionTestDataset(para_test_data, args)
+  test_loader = DataLoader(test_dataset, shuffle=False, batch_size=args.batch_size, collate_fn=test_dataset.collate_fn)
+
+  sent_ids, preds = predict_test(test_loader, model, device, args, test_dataset.tokenizer, threshold)
+  write_submission_csv(args.para_test_out, sent_ids, preds)
+  print(f"Wrote test predictions to {args.para_test_out}")
+
+
+def get_args():
+  parser = argparse.ArgumentParser()
+
+  parser.add_argument("--para_train", type=str, default="data/quora-train.csv")
+  parser.add_argument("--para_dev", type=str, default="data/quora-dev.csv")
+  parser.add_argument("--para_test", type=str, default="data/quora-test-student.csv")
+  parser.add_argument("--para_dev_out", type=str, default="predictions/para-dev-output.csv")
+  parser.add_argument("--para_test_out", type=str, default="predictions/para-test-output.csv")
+
+  parser.add_argument("--seed", type=int, default=11711)
+  parser.add_argument("--epochs", type=int, default=10)
+  parser.add_argument("--use_gpu", action='store_true', default=torch.cuda.is_available())
+  parser.add_argument("--no_use_gpu", action='store_false', dest='use_gpu')
+
+  parser.add_argument("--batch_size", type=int, default=8)
+  parser.add_argument("--lr", type=float, default=1e-5)
+  parser.add_argument("--weight_decay", type=float, default=0.0)
+  parser.add_argument("--grad_accum_steps", type=int, default=1)
+  parser.add_argument("--max_length", type=int, default=128)
+  parser.add_argument("--debug_subset", type=int, default=None)
+  parser.add_argument("--save_dir", type=str, default="runs/paraphrase")
+  parser.add_argument("--run_name", type=str, default=None)
+
+  parser.add_argument("--template_id", type=int, choices=[1, 2], default=1)
+  parser.add_argument("--bidirectional", action='store_true')
+  parser.add_argument("--restricted_yes_no_loss", action='store_true')
+  parser.add_argument("--threshold_tuning", action='store_true')
+  parser.add_argument("--threshold", type=float, default=0.5)
+
+  parser.add_argument("--model_size", type=str, choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
+
+  args = parser.parse_args()
+  if args.grad_accum_steps < 1:
+    raise ValueError("--grad_accum_steps must be >= 1")
+  if args.run_name is None:
+    args.run_name = f"template{args.template_id}_lr{args.lr}_ep{args.epochs}"
+  args.output_dir = os.path.join(args.save_dir, args.run_name)
+  args.filepath = os.path.join(args.output_dir, "best_model.pt")
   return args
 
 
 if __name__ == "__main__":
-  args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # 경로명 저장.
-  seed_everything(args.seed)  # 재현성을 위한 random seed 고정.
-  train(args)
-  test(args)
+  args = add_arguments(get_args())
+  seed_everything(args.seed)
+  threshold = train(args)
+  test(args, threshold)

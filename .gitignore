@@ -3,5 +3,10 @@
 *.pyc
 *.pt
 *.pkl
+*.zip
+*.pdf
 .idea/
 out/
+outputs/
+runs/
+__pycache__/
