@@ -1,0 +1,15 @@
+{
+  "dev_accuracy": 0.905958594078508,
+  "model_a": {
+    "name": "e7_seed11711",
+    "run_dir": "runs/paraphrase/e7_template1_bidir_restricted_ep2",
+    "weight": 0.47
+  },
+  "model_b": {
+    "name": "e9_seed42",
+    "run_dir": "runs/paraphrase/e9_template1_bidir_restricted_ep2_seed42",
+    "weight": 0.53
+  },
+  "test_labels_used": false,
+  "threshold": 0.55
+}

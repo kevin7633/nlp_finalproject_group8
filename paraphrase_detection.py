@@ -459,6 +459,8 @@ def get_args():
   parser.add_argument("--restricted_yes_no_loss", action='store_true')
   parser.add_argument("--threshold_tuning", action='store_true')
   parser.add_argument("--threshold", type=float, default=0.5)
+  parser.add_argument("--skip_test", action='store_true',
+                      help="Train and evaluate on dev without loading or predicting the test split.")
 
   parser.add_argument("--model_size", type=str, choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
 
@@ -476,4 +478,5 @@ if __name__ == "__main__":
   args = add_arguments(get_args())
   seed_everything(args.seed)
   threshold = train(args)
-  test(args, threshold)
+  if not args.skip_test:
+    test(args, threshold)
