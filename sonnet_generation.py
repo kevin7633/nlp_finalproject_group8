@@ -51,8 +51,9 @@ class SonnetGPT(nn.Module):
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    # clean 14-line sonnet dataset에서 먼저 full fine-tuning baseline을 다시 확인한다.
-    # 이후 partial fine-tuning과 비교하기 위한 기준 모델로 사용한다.
+    # 최종 실험에서는 GPT-2 전체 파라미터를 fine-tuning한다.
+    # 작은 소네트 데이터셋에서는 partial fine-tuning도 실험했지만,
+    # 최종 선택 모델은 전체 fine-tuning에서 더 안정적인 생성 결과를 보였다.
     for param in self.gpt.parameters():
       param.requires_grad = True
 
@@ -76,13 +77,13 @@ class SonnetGPT(nn.Module):
     Returns:
       logits: [batch_size, seq_len, vocab_size] 형태의 다음 토큰 예측 점수
     """
-    # GPT-2에 전체 입력 시퀀스를 통과시킨다.
-    # 출력 hidden state의 크기는 [B, T, H]이다.
+    # GPT-2에 전체 입력 시퀀스를 통과시켜 각 위치의 hidden state를 얻는다.
+  # 출력 hidden state의 크기는 [batch_size, seq_len, hidden_dim]이다.
     outputs = self.gpt(input_ids, attention_mask)
     sequence_output = outputs["last_hidden_state"]
 
     # 각 위치의 hidden state를 vocabulary logits로 변환한다.
-    # 이를 통해 학습 루프에서 logits[:, :-1]과 input_ids[:, 1:]를 비교하는
+    # 이렇게 해야 학습 시 t번째 토큰으로 t+1번째 토큰을 예측하는
     # next-token prediction loss를 계산할 수 있다.
     logits = self.gpt.hidden_state_to_token(sequence_output)
 
@@ -179,8 +180,8 @@ class SonnetGPT(nn.Module):
       current_tokens = token_ids[0].detach().cpu().tolist()
 
       # 줄 수 판단은 prompt를 제외한 generated 부분만 기준으로 한다.
-      # prompt에는 이미 앞 3행이 들어 있으므로, prompt까지 포함해서 줄 수를 세면
-      # 남은 행을 충분히 생성하기 전에 종료될 수 있다.
+      # held-out prompt에는 이미 앞 3행이 들어 있으므로,
+      # prompt까지 포함해서 줄 수를 세면 남은 행을 충분히 생성하기 전에 종료될 수 있다.
       generated_tokens_for_check = token_ids[0, prompt_length:].detach().cpu().tolist()
       decoded_text = self.tokenizer.decode(generated_tokens_for_check, skip_special_tokens=True)
       current_lines = [
@@ -209,8 +210,8 @@ class SonnetGPT(nn.Module):
           logits_last_token[:, banned_tokens] = -float("inf")
 
       # 줄바꿈 제어를 적용한다.
-      # 현재 줄이 어느 정도 길어졌다면 newline token의 logit을 높여 줄바꿈을 유도한다.
-      # 현재 줄이 너무 길어졌다면 산문처럼 길게 이어지는 것을 막기 위해 newline을 강제로 선택한다.
+      # 현재 줄이 충분히 길어졌다면 newline token의 logit을 높여 줄바꿈을 유도하고,
+      # 너무 길어진 경우에는 newline을 강제로 선택하여 산문처럼 길게 이어지는 출력을 막는다.
       force_newline = (
         newline_token_id is not None
         and current_line_len >= max_tokens_per_line
@@ -410,8 +411,11 @@ def repetition_score(lines):
 
 def is_complete_sonnet_candidate(text, target_lines=14):
   """
-  생성 후보가 제출 가능한 14행 소네트 형태인지 검사한다.
-  reference는 사용하지 않고, 생성 텍스트 자체의 형식만 확인한다.
+  생성 후보가 완결된 14행 소네트 형태인지 검사한다.
+
+  이 함수는 정답 reference를 보지 않고 생성 텍스트 자체만 확인한다.
+  best-of-N 후보 선택 과정에서 마지막 줄이 너무 짧거나 끊긴 후보보다
+  형식적으로 완결된 후보를 우선 선택하기 위한 bonus 기준으로 사용된다.
   """
   cleaned = clean_sonnet(text, max_lines=target_lines)
   lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
@@ -468,12 +472,12 @@ def candidate_quality_score(text, target_lines=14):
   생성 텍스트 자체에서 확인 가능한 형식적 기준만 사용한다.
 
   주요 기준:
-    1. 목표 행 수인 14행에 가까    후보를 선호한다.
+    1. 목표 행 수인 14행에 가까운 후보를 선호한다.
     2. 반복되는 줄이나 줄 끝 단어를 감점한다.
     3. ABAB CDCD EFEF GG 운율 구조에 가까우면 가점한다.
     4. 마지막 줄이 너무 짧거나 조각난 단어로 끝나면 감점한다.
-    5. 페이지/문서 ,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,, 특수문자, 현대적 표현, 부적절 표현을 감점한다.
-    6. 줄 길이가  너무 긴 후보를 감점한다.너무 
+    5. 페이지 표기, 문서 노이즈, 특수문자, 현대적 표현, 부적절 표현을 감점한다.
+    6. 한 줄이 너무 길어 산문처럼 보이는 후보를 감점한다.
   """
   cleaned = clean_sonnet(text, max_lines=target_lines)
   lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
@@ -757,7 +761,8 @@ def generate_submission_sonnets(args):
       score = candidate_quality_score(candidate_text, target_lines=args.target_lines)
 
       # 완결성이 있는 14행 후보를 우선 선택한다.
-      # complete 후보는 점수에 보너스를 주어, 마지막 줄이 끊긴 후보 우선되게 .
+      # complete 후보에는 보너스를 부여하여,
+      # 마지막 줄이 끊긴 후보보다 선택될 가능성을 높인다.
       if is_complete_sonnet_candidate(candidate_text, target_lines=args.target_lines):
         score += 5.0
 
