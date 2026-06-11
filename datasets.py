@@ -160,11 +160,32 @@ class SonnetsDataset(Dataset):
     with open(file_path, 'r', encoding='utf-8') as f:
       text = f.read()
 
-    # Split sonnets based on numbering pattern (e.g., "\n\n1\n\n")
-    sonnets = re.split(r'\n\s*\d+\s*\n', text)[1:]  # Remove header text
+    # 번호 줄을 기준으로 소네트 단위를 분리한다.
+    # 맨 앞 Folger header는 실제 소네트가 아니므로 제거한다.
+    sonnets = re.split(r'\n\s*\d+\s*\n', text)[1:]
 
-    # Strip leading/trailing spaces
-    return [s.strip() for s in sonnets]
+    cleaned_sonnets = []
+    is_held_out = "held_out" in file_path
+
+    for sonnet in sonnets:
+      lines = [line.rstrip() for line in sonnet.strip().splitlines() if line.strip()]
+
+      # held-out 파일은 평가용 prompt만 포함한다.
+      # 각 예시는 소네트 전체가 아니라 앞 3행만 제공되므로,
+      # 학습용 14행 필터를 적용하지 않고 3행 prompt 그대로 보존한다.
+      if is_held_out:
+        if len(lines) == 3:
+          cleaned_sonnets.append("\n".join(lines))
+        continue
+
+      # train 파일에서는 표준 소네트 형식인 14행 예시만 학습에 사용한다.
+      # 원본 파일에는 header나 비정상 길이 block이 섞일 수 있으므로,
+      # 12행/15행 예시는 형식 학습을 방해하지 않도록 제외한다.
+      if len(lines) == 14:
+        cleaned_sonnets.append("\n".join(lines))
+
+    print(f"Loaded {len(cleaned_sonnets)} sonnets from {file_path}")
+    return cleaned_sonnets
 
   def __len__(self):
     return len(self.sonnets)
