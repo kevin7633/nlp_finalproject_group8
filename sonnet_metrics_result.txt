@@ -1,0 +1,6 @@
+Trainable GPT parameters: 125,030,400 / 125,030,400
+===== Sonnet Generation Evaluation =====
+Compared sonnet ids: ['132', '133', '134', '135', '136', '137', '138', '139', '140', '141', '142', '143']
+CHRF: 42.9080
+Perplexity loss: 4.1608
+Perplexity: 64.1216
