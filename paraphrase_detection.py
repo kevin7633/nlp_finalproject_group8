@@ -9,6 +9,7 @@ fixed, to create the submission prediction file.
 import argparse
 import csv
 import json
+import math
 import os
 import random
 import re
@@ -19,6 +20,7 @@ import torch.nn.functional as F
 
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from transformers import GPT2Tokenizer
 
@@ -152,6 +154,44 @@ def add_bidirectional_examples(data):
     augmented.append((q1, q2, label, sent_id))
     augmented.append((q2, q1, label, f"{sent_id}__rev"))
   return augmented
+
+
+def word_tokens(text):
+  return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def is_hard_negative(q1, q2, overlap_threshold):
+  words1 = word_tokens(q1)
+  words2 = word_tokens(q2)
+  overlap = len(words1 & words2) / max(1, len(words1 | words2))
+  negations = {'not', 'never', 'no'}
+  negation_mismatch = bool(words1 & negations) != bool(words2 & negations)
+  numbers1 = set(re.findall(r"\b\d+(?:\.\d+)?\b", q1))
+  numbers2 = set(re.findall(r"\b\d+(?:\.\d+)?\b", q2))
+  number_mismatch = bool(numbers1 or numbers2) and numbers1 != numbers2
+  return overlap >= overlap_threshold or negation_mismatch or number_mismatch
+
+
+def oversample_hard_negatives(data, factor, overlap_threshold):
+  if factor <= 1:
+    return data
+  augmented = list(data)
+  hard_count = 0
+  for q1, q2, label, sent_id in data:
+    if label == 0 and is_hard_negative(q1, q2, overlap_threshold):
+      hard_count += 1
+      for copy_idx in range(1, factor):
+        augmented.append((q1, q2, label, f"{sent_id}__hard{copy_idx}"))
+  print(f"Oversampled {hard_count} train-only hard negatives by factor {factor}")
+  return augmented
+
+
+def linear_warmup_decay_lambda(current_step, warmup_steps, total_steps):
+  if current_step < warmup_steps:
+    return float(current_step + 1) / max(1, warmup_steps)
+  remaining_steps = max(0, total_steps - current_step)
+  decay_steps = max(1, total_steps - warmup_steps)
+  return float(remaining_steps) / decay_steps
 
 
 def encode_pairs(tokenizer, q1, q2, args, device):
@@ -312,6 +352,11 @@ def train(args):
   para_dev_data = load_paraphrase_data(args.para_dev)
   para_train_data = maybe_debug_subset(para_train_data, args.debug_subset)
   para_dev_data = maybe_debug_subset(para_dev_data, args.debug_subset)
+  para_train_data = oversample_hard_negatives(
+    para_train_data,
+    args.hard_negative_oversample_factor,
+    args.hard_negative_overlap
+  )
   if args.bidirectional:
     para_train_data = add_bidirectional_examples(para_train_data)
 
@@ -323,6 +368,15 @@ def train(args):
   tokenizer = train_dataset.tokenizer
   model = ParaphraseGPT(args).to(device)
   optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+  updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
+  total_update_steps = updates_per_epoch * args.epochs
+  scheduler = None
+  if args.scheduler == 'linear':
+    warmup_steps = int(total_update_steps * args.warmup_ratio)
+    scheduler = LambdaLR(
+      optimizer,
+      lambda step: linear_warmup_decay_lambda(step, warmup_steps, total_update_steps)
+    )
 
   best_dev_acc = -1.0
   best_threshold = args.threshold
@@ -358,7 +412,11 @@ def train(args):
 
       (loss / args.grad_accum_steps).backward()
       if step % args.grad_accum_steps == 0 or step == len(train_loader):
+        if args.max_grad_norm > 0:
+          torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optimizer.step()
+        if scheduler is not None:
+          scheduler.step()
         optimizer.zero_grad()
 
       train_loss += loss.item()
@@ -377,6 +435,7 @@ def train(args):
       'dev_accuracy_at_default_threshold': dev_acc,
       'dev_accuracy': threshold_acc,
       'threshold': epoch_threshold,
+      'learning_rate': optimizer.param_groups[0]['lr'],
     })
 
     if threshold_acc > best_dev_acc:
@@ -449,7 +508,12 @@ def get_args():
   parser.add_argument("--lr", type=float, default=1e-5)
   parser.add_argument("--weight_decay", type=float, default=0.0)
   parser.add_argument("--grad_accum_steps", type=int, default=1)
+  parser.add_argument("--scheduler", choices=['none', 'linear'], default='none')
+  parser.add_argument("--warmup_ratio", type=float, default=0.0)
+  parser.add_argument("--max_grad_norm", type=float, default=0.0)
   parser.add_argument("--max_length", type=int, default=128)
+  parser.add_argument("--hard_negative_oversample_factor", type=int, default=1)
+  parser.add_argument("--hard_negative_overlap", type=float, default=0.5)
   parser.add_argument("--debug_subset", type=int, default=None)
   parser.add_argument("--save_dir", type=str, default="runs/paraphrase")
   parser.add_argument("--run_name", type=str, default=None)
@@ -467,6 +531,10 @@ def get_args():
   args = parser.parse_args()
   if args.grad_accum_steps < 1:
     raise ValueError("--grad_accum_steps must be >= 1")
+  if args.hard_negative_oversample_factor < 1:
+    raise ValueError("--hard_negative_oversample_factor must be >= 1")
+  if not 0.0 <= args.warmup_ratio < 1.0:
+    raise ValueError("--warmup_ratio must be in [0, 1)")
   if args.run_name is None:
     args.run_name = f"template{args.template_id}_lr{args.lr}_ep{args.epochs}"
   args.output_dir = os.path.join(args.save_dir, args.run_name)

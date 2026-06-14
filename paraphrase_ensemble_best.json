@@ -1,15 +1,29 @@
 {
-  "dev_accuracy": 0.905958594078508,
-  "model_a": {
-    "name": "e7_seed11711",
-    "run_dir": "runs/paraphrase/e7_template1_bidir_restricted_ep2",
-    "weight": 0.47
-  },
-  "model_b": {
-    "name": "e9_seed42",
-    "run_dir": "runs/paraphrase/e9_template1_bidir_restricted_ep2_seed42",
-    "weight": 0.53
-  },
+  "dev_accuracy": 0.9073932078458532,
+  "ensemble": [
+    {
+      "name": "E7",
+      "run_dir": "runs/paraphrase/e7_template1_bidir_restricted_ep2",
+      "weight": 0.15009999999999996
+    },
+    {
+      "name": "E9",
+      "run_dir": "runs/paraphrase/e9_template1_bidir_restricted_ep2_seed42",
+      "weight": 0.371142
+    },
+    {
+      "name": "E10",
+      "run_dir": "runs/paraphrase/e10_template1_bidir_restricted_ep2_seed2026",
+      "weight": 0.26875800000000005
+    },
+    {
+      "name": "E11",
+      "run_dir": "runs/paraphrase/e11_template1_bidir_restricted_lr1e5_ep3",
+      "weight": 0.20999999999999996
+    }
+  ],
+  "output_dir": "runs/paraphrase/ensemble_e7_e9_e10_e11_final",
+  "search": "greedy_convex_addition",
   "test_labels_used": false,
-  "threshold": 0.55
+  "threshold": 0.6000000000000003
 }
